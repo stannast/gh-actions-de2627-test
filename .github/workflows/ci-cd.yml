@@ -1,0 +1,181 @@
+name: CI/CD Workflow
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ./app
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    - name: Set up Python 3.10
+      uses: actions/setup-python@v5
+      with:
+        python-version: "3.10"
+
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install flake8 pytest
+        if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+
+    - name: Lint with flake8
+      run: |
+        # stop the build if there are Python syntax errors or undefined names
+        flake8 . --count --select=E9,F63,F7,F82 --show-source --statistics
+        # exit-zero treats all errors as warnings. The GitHub editor is 127 chars wide
+        flake8 . --count --exit-zero --max-complexity=10 --max-line-length=127 --statistics
+
+    - name: Test with pytest
+      run: |
+        pytest || [ $? -eq 5 ]
+
+    - name: Set up QEMU
+      uses: docker/setup-qemu-action@v3
+
+    - name: Set up Docker Buildx
+      id: buildx
+      uses: docker/setup-buildx-action@v3
+
+    - name: Cache Docker layers
+      uses: actions/cache@v4
+      with:
+        path: /tmp/.buildx-cache
+        key: ${{ runner.os }}-buildx-${{ github.sha }}
+        restore-keys: |
+          ${{ runner.os }}-buildx-
+
+    - name: Login to Docker Hub
+      if: github.event_name == 'push'
+      uses: docker/login-action@v3
+      with:
+        username: ${{ secrets.DOCKER_USERNAME }}
+        password: ${{ secrets.DOCKER_PASSWORD }}
+
+    - name: Build and push
+      uses: docker/build-push-action@v5
+      with:
+        context: ./app
+        file: ./app/Dockerfile
+        target: builder
+        builder: ${{ steps.buildx.outputs.name }}
+        push: ${{ github.event_name == 'push' }}
+        tags: ${{ secrets.DOCKER_USERNAME }}/hello-gitops:${{ github.sha }}, ${{ secrets.DOCKER_USERNAME }}/hello-gitops:latest
+        platforms: linux/amd64,linux/arm64
+        cache-from: type=local,src=/tmp/.buildx-cache
+        cache-to: type=local,dest=/tmp/.buildx-cache
+
+  deploy:
+    name: Deploy
+    runs-on: ubuntu-latest
+    needs: build
+    if: false
+    # if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+
+    concurrency:
+      group: deploy-gke
+      cancel-in-progress: false
+
+    env:
+      PROJECT_ID: ${{ secrets.GKE_PROJECT }}
+      # TODO: update to cluster name
+      GKE_CLUSTER: autopilot-cluster-1
+      # TODO: update to cluster region
+      GKE_REGION: us-central1
+
+    steps:
+    - name: Check out code
+      uses: actions/checkout@v4
+
+    - name: Setup Kustomize
+      uses: imranismail/setup-kustomize@v2
+      with:
+        kustomize-version: "5.4.3"
+
+    - name: Authenticate to Google Cloud
+      uses: google-github-actions/auth@v2
+      with:
+        credentials_json: ${{ secrets.GCP_CREDENTIALS }}
+
+    - name: Set up Cloud SDK
+      uses: google-github-actions/setup-gcloud@v2
+      with:
+        install_components: gke-gcloud-auth-plugin,kubectl
+
+    - name: Get the GKE credentials so we can deploy to the cluster
+      run: |
+        gcloud container clusters get-credentials "$GKE_CLUSTER" --region "$GKE_REGION" --project "$PROJECT_ID"
+
+    - name: Create namespace & set in Kustomize
+      run: |
+        if ! kubectl get ns python-app-blue > /dev/null 2>&1; then
+          NEW=python-app-blue
+          OLD=python-app-green
+        elif ! kubectl get ns python-app-green > /dev/null 2>&1; then
+          NEW=python-app-green
+          OLD=python-app-blue
+        else
+          echo "Both Blue and Green namespaces are present! Exiting"
+          exit 1
+        fi
+        kubectl create ns "$NEW"
+        (cd k8s && kustomize edit set namespace "$NEW")
+        echo "NEW_NAMESPACE=$NEW" >> $GITHUB_ENV
+        echo "OLD_NAMESPACE=$OLD" >> $GITHUB_ENV
+
+    - name: Update Kubernetes resources
+      env:
+        DOCKER_USERNAME: ${{ secrets.DOCKER_USERNAME }}
+      run: |
+        cd k8s
+        kustomize edit set image hello-gitops=$DOCKER_USERNAME/hello-gitops:$GITHUB_SHA
+        cat kustomization.yaml
+
+    - name: Deploy updated Kubernetes resources
+      run: |
+        kubectl apply -k k8s/
+
+    - name: Wait for rollout
+      run: |
+        kubectl -n "$NEW_NAMESPACE" rollout status deployment/redis --timeout=180s
+        kubectl -n "$NEW_NAMESPACE" rollout status deployment/hello-gitops --timeout=180s
+
+    - name: Smoke test
+      run: |
+        kubectl -n "$NEW_NAMESPACE" run smoke-test --rm -i --restart=Never \
+          --image=curlimages/curl -- -fsS http://hello-gitops/
+
+    - name: Rollback on failure
+      if: failure() && env.NEW_NAMESPACE != ''
+      run: |
+        kubectl delete ns "$NEW_NAMESPACE" --wait=false
+
+    - name: Remove old namespace
+      run: |
+        if kubectl get ns "$OLD_NAMESPACE" > /dev/null 2>&1; then
+          kubectl delete ns "$OLD_NAMESPACE" --wait=true
+        fi
+
+    - name: Commit files
+      run: |
+        git config --local user.email "action@github.com"
+        git config --local user.name "GitHub Action"
+        git add k8s/kustomization.yaml
+        git commit -m "Bump docker tag [skip ci]"
+
+    - name: Push changes
+      run: |
+        git push
