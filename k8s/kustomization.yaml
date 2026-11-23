@@ -6,8 +6,8 @@ resources:
 - ingress.yaml
 - redis-deployment.yaml
 - redis-service.yaml
-namespace: python-app-blue
+namespace: python-app-green
 images:
 - name: hello-gitops
   newName: stannst/hello-gitops
-  newTag: latest
+  newTag: 70236353968252c9d5618457d311ecd4d0c84cbf
