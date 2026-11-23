@@ -113,6 +113,7 @@ jobs:
     - name: Set up Cloud SDK
       uses: google-github-actions/setup-gcloud@v2
       with:
+        version: '570.0.0'
         install_components: gke-gcloud-auth-plugin,kubectl
 
     - name: Get the GKE credentials so we can deploy to the cluster
