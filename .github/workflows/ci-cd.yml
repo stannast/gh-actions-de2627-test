@@ -119,6 +119,13 @@ jobs:
       run: |
         gcloud container clusters get-credentials "$GKE_CLUSTER" --region "$GKE_REGION" --project "$PROJECT_ID"
 
+    - name: Debug gcloud
+      run: |
+        gcloud --version
+        gke-gcloud-auth-plugin --version
+        gcloud auth list
+        gcloud config config-helper --format=json > /dev/null && echo "config-helper OK"
+
     - name: Create namespace & set in Kustomize
       run: |
         if ! kubectl get ns python-app-blue > /dev/null 2>&1; then
